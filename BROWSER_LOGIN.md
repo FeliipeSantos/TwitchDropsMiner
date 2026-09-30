@@ -8,7 +8,7 @@ error explicitly and uses a dedicated Chrome/Edge profile for new logins.
 ## Signing in
 
 1. Install Chrome or Edge. Windows is the platform tested with a real account.
-2. Start the miner and click **Login**.
+2. Start the miner normally, without **Run as administrator**, and click **Login**.
 3. Sign in directly on Twitch and complete any verification yourself. This first
    browser instance has no debugging connection or debugging command-line flags.
 4. Close all windows of that browser, keeping the miner open. The miner reopens
@@ -28,6 +28,14 @@ bound to loopback.
 
 ## Behavior and limitations
 
+- Elevated Windows launches have a known startup failure. Chrome can relaunch
+  itself without elevated privileges and exit its initial launcher process.
+  The miner currently treats that process exit as the end of manual login and
+  attempts to restart the browser while the login window is still running.
+  This can produce "The browser did not start". Close the miner and its own
+  browser windows, then start the miner normally. Handling the relaunched
+  browser's lifetime remains unresolved; this workaround has not been
+  separately verified in the affected Downloads installation.
 - Browser GQL uses the headers supplied by Twitch in its own tab.
 - The page reloads when captured headers need refreshing.
 - A disconnected browser can restore the saved session. Interrupted allowlisted
