@@ -171,6 +171,7 @@ if __name__ == "__main__":
             client.print(_("error", "captcha"))
         except Exception:
             exit_status = 1
+            logger.exception("Fatal error encountered")
             client.prevent_close()
             client.print("Fatal error encountered:\n")
             client.print(traceback.format_exc())

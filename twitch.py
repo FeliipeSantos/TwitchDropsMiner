@@ -17,6 +17,7 @@ from yarl import URL
 
 from translate import _
 from gui import GUIManager
+from browser_login import BrowserLogin
 from channel import Channel
 from websocket import WebsocketPool
 from inventory import DropsCampaign
@@ -42,6 +43,7 @@ from utils import (
 )
 from constants import (
     CALL,
+    WORKING_DIR,
     MAX_INT,
     DUMP_PATH,
     COOKIES_PATH,
@@ -49,6 +51,7 @@ from constants import (
     GQL_QUERIES,
     WATCH_INTERVAL,
     State,
+    ClientInfo,
     ClientType,
     PriorityMode,
     WebsocketTopic,
@@ -60,7 +63,7 @@ if TYPE_CHECKING:
     from channel import Stream
     from settings import Settings
     from inventory import TimedDrop
-    from constants import ClientInfo, JsonType, GQLOperation
+    from constants import JsonType, GQLOperation
 
 
 logger = logging.getLogger("TwitchDrops")
@@ -101,6 +104,7 @@ class _AuthState:
         self._logged_in.clear()
         self._twitch.gui.help._invalidate_button.config(state="disabled")
         if delete_cookies:
+            self._twitch._browser_forget = True
             session = self._twitch._session
             if session is not None:
                 jar = cast(aiohttp.CookieJar, session.cookie_jar)
@@ -152,6 +156,10 @@ class _AuthState:
                     #     "verification_uri": "https://www.twitch.tv/activate?device-code=ABCDEFGH"
                     # }
                     response_json: JsonType = await response.json()
+                    if response.status != 200 or not isinstance(response_json, dict) or "device_code" not in response_json:
+                        raise LoginException(
+                            "Twitch rejected device-code login. Use browser login instead."
+                        )
                     device_code: str = response_json["device_code"]
                     user_code: str = response_json["user_code"]
                     interval: int = response_json["interval"]
@@ -359,73 +367,78 @@ class _AuthState:
         async with self._lock:
             await self._validate()
 
+    async def _browser_login(self, token: str | None = None, device_id: str | None = None) -> str:
+        twitch = self._twitch
+        if token is None:
+            login_form = twitch.gui.login
+            login_form.update(_("gui", "login", "required"), None)
+            twitch.gui.grab_attention(sound=False)
+            twitch.print("Click Login. Sign in to Twitch in the browser window and complete verification. Then close all windows of this browser, keeping the miner open. It will reopen the browser to confirm your session; keep this second browser instance open or minimized.")
+            await login_form.wait_for_login_press()
+        if token is None:
+            twitch.print("Opening Twitch. After signing in, close this browser's windows to continue. Keep the miner open.")
+        else:
+            twitch.print("Restoring your saved Twitch session. Keep the miner browser open or minimized.")
+        session_data = await twitch.gui.coro_unless_closed(twitch._browser.login(
+            token=token, device_id=device_id, forget=twitch._browser_forget,
+        ))
+        twitch._browser_forget = False
+        twitch._client_type = ClientInfo(
+            ClientType.WEB.CLIENT_URL, ClientType.WEB.CLIENT_ID, session_data["user_agent"]
+        )
+        self.device_id = session_data["device_id"]
+        self.session_id = session_data["session_id"] or create_nonce(CHARS_HEX_LOWER, 16)
+        self.access_token = session_data["token"]
+        session = await twitch.get_session()
+        session.headers["User-Agent"] = session_data["user_agent"]
+        return self.access_token
+
     async def _validate(self):
-        if not hasattr(self, "session_id"):
-            self.session_id = create_nonce(CHARS_HEX_LOWER, 16)
         if not self._hasattrs("device_id", "access_token", "user_id"):
-            session = await self._twitch.get_session()
+            twitch = self._twitch
+            session = await twitch.get_session()
             jar = cast(aiohttp.CookieJar, session.cookie_jar)
-            client_info: ClientInfo = self._twitch._client_type
-        if not self._hasattrs("device_id"):
-            async with self._twitch.request(
-                "GET", client_info.CLIENT_URL, headers=self.headers()
-            ) as response:
-                page_html = await response.text("utf8")
-                assert page_html is not None
-            #     match = re.search(r'twilightBuildID="([-a-z0-9]+)"', page_html)
-            # if match is None:
-            #     raise MinerException("Unable to extract client_version")
-            # self.client_version = match.group(1)
-            # doing the request ends up setting the "unique_id" value in the cookie
-            cookie = jar.filter_cookies(client_info.CLIENT_URL)
-            self.device_id = cookie["unique_id"].value
-        if not self._hasattrs("access_token", "user_id"):
-            # looks like we're missing something
-            login_form: LoginForm = self._twitch.gui.login
-            logger.info("Checking login")
+            cookie = jar.filter_cookies(ClientType.WEB.CLIENT_URL)
+            saved_token = cookie["auth-token"].value if "auth-token" in cookie else None
+            saved_device = cookie["unique_id"].value if "unique_id" in cookie else None
+            login_form = twitch.gui.login
             login_form.update(_("gui", "login", "logging_in"), None)
-            for client_mismatch_attempt in range(2):
-                for invalid_token_attempt in range(2):
-                    cookie = jar.filter_cookies(client_info.CLIENT_URL)
-                    if "auth-token" not in cookie:
-                        self.access_token = await self._oauth_login()
-                        cookie["auth-token"] = self.access_token
-                    elif not hasattr(self, "access_token"):
-                        logger.info("Restoring session from cookie")
-                        self.access_token = cookie["auth-token"].value
-                    # validate the auth token, by obtaining user_id
-                    async with self._twitch.request(
-                        "GET",
-                        "https://id.twitch.tv/oauth2/validate",
-                        headers={"Authorization": f"OAuth {self.access_token}"}
-                    ) as response:
-                        if response.status == 401:
-                            # the access token we have is invalid - clear the cookie and reauth
-                            logger.info("Restored session is invalid")
-                            assert client_info.CLIENT_URL.host is not None
-                            jar.clear_domain(client_info.CLIENT_URL.host)
-                            continue
-                        elif response.status == 200:
-                            validate_response = await response.json()
-                            break
-                else:
-                    raise RuntimeError("Login verification failure (step #2)")
-                # ensure the cookie's client ID matches the currently selected client
-                if validate_response["client_id"] == client_info.CLIENT_ID:
-                    break
-                # otherwise, we need to delete the entire cookie file and clear the jar
-                logger.info("Cookie client ID mismatch")
-                jar.clear()
-                COOKIES_PATH.unlink(missing_ok=True)
+
+            async def validate_token(token: str) -> JsonType | None:
+                async with twitch.request(
+                    "GET", "https://id.twitch.tv/oauth2/validate",
+                    headers={"Authorization": f"OAuth {token}"},
+                ) as response:
+                    if response.status == 401:
+                        return None
+                    if response.status != 200:
+                        raise LoginException("Twitch could not validate the session. Please try again later.")
+                    return await response.json()
+
+            validated = await validate_token(saved_token) if saved_token else None
+            if validated and validated.get("client_id") == ClientType.ANDROID_APP.CLIENT_ID:
+                # Existing Android sessions still work; preserve them without migration.
+                twitch._client_type = ClientType.ANDROID_APP
+                session.headers["User-Agent"] = ClientType.ANDROID_APP.USER_AGENT
+                self.access_token = cast(str, saved_token)
+                self.device_id = saved_device or create_nonce(CHARS_HEX_LOWER, 32)
+                self.session_id = create_nonce(CHARS_HEX_LOWER, 16)
             else:
-                raise RuntimeError("Login verification failure (step #1)")
-            self.user_id = int(validate_response["user_id"])
-            cookie["persistent"] = str(self.user_id)
-            logger.info(f"Login successful, user ID: {self.user_id}")
-            login_form.update(_("gui", "login", "logged_in"), self.user_id)
-            # update our cookie and save it
-            jar.update_cookies(cookie, client_info.CLIENT_URL)
+                if validated and validated.get("client_id") != ClientType.WEB.CLIENT_ID:
+                    raise LoginException("The saved session belongs to another Twitch client. Back up cookies.jar and use Help -> invalidate session to sign in again.")
+                restore = saved_token if validated else None
+                if saved_token and not validated:
+                    twitch._browser_forget = True
+                await self._browser_login(restore, saved_device)
+                validated = await validate_token(self.access_token)
+                if not validated or validated.get("client_id") != ClientType.WEB.CLIENT_ID:
+                    raise LoginException("Twitch rejected the browser session. Sign in again using the Help tab.")
+            self.user_id = int(validated["user_id"])
+            jar.update_cookies({"auth-token": self.access_token, "unique_id": self.device_id,
+                                "persistent": str(self.user_id)}, ClientType.WEB.CLIENT_URL)
             jar.save(COOKIES_PATH)
+            logger.info("Login validated successfully (%s)", "WEB" if twitch._client_type.CLIENT_ID == ClientType.WEB.CLIENT_ID else "ANDROID")
+            login_form.update(_("gui", "login", "logged_in"), self.user_id)
         self._twitch.gui.help._invalidate_button.config(state="normal")
         self._logged_in.set()
 
@@ -448,6 +461,8 @@ class Twitch:
         self._client_type: ClientInfo = ClientType.ANDROID_APP
         self._session: aiohttp.ClientSession | None = None
         self._auth_state: _AuthState = _AuthState(self)
+        self._browser = BrowserLogin(WORKING_DIR / "browser_session", str(settings.proxy), self.print)
+        self._browser_forget = False
         # GUI
         self.gui = GUIManager(self)
         # Storing and watching channels
@@ -506,6 +521,7 @@ class Twitch:
             self._mnt_task = None
         # stop websocket, close session and save cookies
         await self.websocket.stop(clear_topics=True)
+        await self._browser.close()
         if self._session is not None:
             cookie_jar = cast(aiohttp.CookieJar, self._session.cookie_jar)
             # clear empty cookie entries off the cookies file before saving
@@ -1305,13 +1321,21 @@ class Twitch:
         for delay in backoff:
             async with self._qgl_limiter:
                 auth_state = await self.get_auth()
-                async with self.request(
-                    "POST",
-                    "https://gql.twitch.tv/gql",
-                    json=ops,
-                    headers=auth_state.headers(user_agent=self._client_type.USER_AGENT, gql=True),
-                ) as response:
-                    response_json: JsonType | list[JsonType] = await response.json()
+                if self._client_type.CLIENT_ID == ClientType.WEB.CLIENT_ID:
+                    read_names = {GQL_QUERIES[key]["operationName"] for key in (
+                        "GetStreamInfo", "ChannelPointsContext", "Inventory", "CurrentDrop",
+                        "Campaigns", "CampaignDetails", "AvailableDrops", "PlaybackAccessToken",
+                        "GameDirectory", "SlugRedirect",
+                    )}
+                    operation_list = ops if isinstance(ops, list) else [ops]
+                    read_only = all(operation.get("operationName") in read_names for operation in operation_list)
+                    response_json = await self.gui.coro_unless_closed(self._browser.gql(ops, read_only=read_only))
+                else:
+                    async with self.request(
+                        "POST", "https://gql.twitch.tv/gql", json=ops,
+                        headers=auth_state.headers(user_agent=self._client_type.USER_AGENT, gql=True),
+                    ) as response:
+                        response_json = await response.json()
             gql_logger.debug(f"GQL Response: {response_json}")
             orig_response = response_json
             if isinstance(response_json, list):
@@ -1324,6 +1348,8 @@ class Twitch:
                 if "errors" in response_json:
                     for error_dict in response_json["errors"]:
                         if "message" in error_dict:
+                            if error_dict["message"] == "failed integrity check":
+                                raise LoginException("Twitch rejected the browser integrity check. Check the Twitch window and restart the miner.")
                             if (
                                 single_retry
                                 and error_dict["message"] in (
@@ -1427,6 +1453,7 @@ class Twitch:
         # fetch general available campaigns data (campaigns)
         response = await self.gql_request(GQL_QUERIES["Campaigns"])
         available_list: list[JsonType] = response["data"]["currentUser"]["dropCampaigns"] or []
+        logger.info("Inventory loaded: %d in-progress campaigns; dashboard loaded: %d campaigns", len(ongoing_campaigns), len(available_list))
         applicable_statuses = ("ACTIVE", "UPCOMING")
         available_campaigns: dict[str, JsonType] = {
             c["id"]: c

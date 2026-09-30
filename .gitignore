@@ -26,3 +26,5 @@ settings.json
 /*.AppImage.zsync
 .DS_Store
 *.app
+# Dedicated browser profile contains private Twitch session data.
+browser_session/
